@@ -69,11 +69,11 @@ For access from China, read [sources for users from China](#sources-for-users-fr
   ```
 
 - Clone _CVAT_ source code from the
-  [GitHub repository](https://github.com/opencv/cvat).
+  [GitHub repository](https://github.com/acetrace/cvat).
 
   ```bash
   sudo apt-get --no-install-recommends install -y git
-  git clone https://github.com/opencv/cvat
+  git clone https://github.com/acetrace/cvat
   cd cvat
   ```
 - To access CVAT over a network or through a different system, export `CVAT_HOST` environment variable
@@ -148,10 +148,10 @@ For access from China, read [sources for users from China](#sources-for-users-fr
 - Go to windows menu, find `Git Bash` application and run it. You should see a terminal window.
 
 - Clone _CVAT_ source code from the
-  [GitHub repository](https://github.com/opencv/cvat).
+  [GitHub repository](https://github.com/acetrace/cvat).
 
   ```bash
-  git clone https://github.com/opencv/cvat
+  git clone https://github.com/acetrace/cvat
   cd cvat
   ```
 
@@ -224,10 +224,10 @@ For access from China, read [sources for users from China](#sources-for-users-fr
   launch Spotlight and type "Terminal," then double-click the search result.
 
 - Clone _CVAT_ source code from the
-  [GitHub repository](https://github.com/opencv/cvat).
+  [GitHub repository](https://github.com/acetrace/cvat).
 
   ```bash
-  git clone https://github.com/opencv/cvat
+  git clone https://github.com/acetrace/cvat
   cd cvat
   ```
 
