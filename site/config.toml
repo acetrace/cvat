@@ -1,6 +1,7 @@
 baseURL = "/"
 title = "CVAT"
 relativeURLs = true
+publishdir = "../docs"
 
 enableRobotsTXT = true
 
@@ -52,7 +53,7 @@ anchor = "smart"
 [[menu.main]]
     name = "GitHub"
     weight = 60
-    url = "https://github.com/openvinotoolkit/cvat"
+    url = "https://github.com/acetrace/cvat"
     pre = "<i class='fab fa-github'></i>"
 
 [services]
@@ -84,7 +85,7 @@ weight = 1
 
 # Comment out if you don't want the "print entire section" link enabled.
 [outputs]
-section = ["HTML", "print"]
+section = ["HTML"]
 
 [params]
 intel_terms_of_use = "https://www.intel.com/content/www/us/en/legal/terms-of-use.html"
