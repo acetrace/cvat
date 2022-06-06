@@ -1,4 +1,4 @@
-attrs==21.2.0
+attrs==21.3.0
 click==7.1.2
 Django==3.2.12
 django-appconf==1.0.4
@@ -37,18 +37,20 @@ h5py==3.6.0
 django-cors-headers==3.5.0
 furl==2.1.0
 av==8.0.2 --no-binary=av
+psycopg2==2.8.6
+psycopg2-binary==2.8.6
 #tensorflow==2.8.0 # Optional requirement of Datumaro. Use tensorflow-macos==2.8.0 for Mac M1
 # The package is used by pyunpack as a command line tool to support multiple
 # archives. Don't use as a python module because it has GPL license.
 patool==1.12
 diskcache==5.0.2
-open3d==0.11.2
+open3d==0.14.1
 boto3==1.17.61
 azure-storage-blob==12.8.1
 google-cloud-storage==1.42.0
 # --no-binary=datumaro: workaround for pip to install
 # opencv-headless instead of regular opencv, to actually run setup script
-datumaro==0.2.0 --no-binary=datumaro
+git+https://github.com/evekeen/datumaro.git@develop#egg=datumaro --no-binary=datumaro
 urllib3>=1.26.5 # not directly required, pinned by Snyk to avoid a vulnerability
 natsort==8.0.0
 mistune>=2.0.1 # not directly required, pinned by Snyk to avoid a vulnerability
