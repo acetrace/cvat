@@ -24,7 +24,7 @@ def _export(dst_file, instance_data, save_images=False):
         instance_data, include_images=save_images), env=dm_env)
     with TemporaryDirectory() as temp_dir:
         dataset.export(temp_dir, 'voc', save_images=save_images,
-            label_map='source')
+            label_map='source', image_ext='jpg', jpeg_quality=95)
 
         make_zip_archive(temp_dir, dst_file)
 

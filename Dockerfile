@@ -14,6 +14,7 @@ RUN apt-get update && \
         libgeos-dev \
         libldap2-dev \
         libsasl2-dev \
+        libpq-dev \
         nasm \
         git \
         pkg-config \
