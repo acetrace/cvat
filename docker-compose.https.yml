@@ -9,11 +9,13 @@ services:
     labels:
       - traefik.http.routers.cvat.entrypoints=websecure
       - traefik.http.routers.cvat.tls.certresolver=lets-encrypt
+      - traefik.http.middlewares.limit.buffering.maxRequestBodyBytes=5000000000
 
   cvat_ui:
     labels:
       - traefik.http.routers.cvat-ui.entrypoints=websecure
       - traefik.http.routers.cvat-ui.tls.certresolver=lets-encrypt
+      - traefik.http.middlewares.limit.buffering.maxRequestBodyBytes=5000000000
 
   traefik:
     image: traefik:v2.4
