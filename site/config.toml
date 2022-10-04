@@ -9,7 +9,7 @@ enableRobotsTXT = true
 theme = ["docsy"]
 
 # Will give values to .Lastmod etc.
-enableGitInfo = true
+enableGitInfo = false
 
 # Language settings
 contentDir = "content/en"
@@ -49,7 +49,7 @@ anchor = "smart"
 [[menu.main]]
     name = "Try it now"
     weight = 50
-    url = "https://cvat.org"
+    url = "https://app.cvat.ai"
 [[menu.main]]
     name = "GitHub"
     weight = 60
@@ -187,7 +187,7 @@ enable = false
 # Developer relevant links. These will show up on right side of footer and in the community page if you have one.
 [[params.links.developer]]
 	name = "GitHub"
-	url = "https://github.com/openvinotoolkit/cvat"
+	url = "https://github.com/cvat-ai/cvat"
 	icon = "fab fa-github"
         desc = "Development takes place here!"
 [[params.links.developer]]
