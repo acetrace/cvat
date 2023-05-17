@@ -1,5 +1,5 @@
 # Copyright (C) 2021-2022 Intel Corporation
-# Copyright (C) 2022 CVAT.ai Corporation
+# Copyright (C) 2022-2023 CVAT.ai Corporation
 #
 # SPDX-License-Identifier: MIT
 
@@ -9,6 +9,7 @@ from enum import Enum
 import re
 import shutil
 import tempfile
+from typing import Any, Dict, Iterable
 import uuid
 from zipfile import ZipFile
 from datetime import datetime
@@ -18,32 +19,30 @@ import django_rq
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
-from django.shortcuts import get_object_or_404
+
 from rest_framework import serializers, status
 from rest_framework.parsers import JSONParser
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError, PermissionDenied, NotFound
 from django_sendfile import sendfile
 from distutils.util import strtobool
 
 import cvat.apps.dataset_manager as dm
 from cvat.apps.engine import models
 from cvat.apps.engine.log import slogger
-from cvat.apps.engine.serializers import (AttributeSerializer, DataSerializer,
+from cvat.apps.engine.serializers import (AttributeSerializer, DataSerializer, LabelSerializer,
     LabeledDataSerializer, SegmentSerializer, SimpleJobSerializer, TaskReadSerializer,
     ProjectReadSerializer, ProjectFileSerializer, TaskFileSerializer)
-from cvat.apps.engine.utils import av_scan_paths, process_failed_job, configure_dependent_job
+from cvat.apps.engine.utils import av_scan_paths, process_failed_job, configure_dependent_job, get_rq_job_meta
 from cvat.apps.engine.models import (
-    StorageChoice, StorageMethodChoice, DataChoice, Task, Project, Location,
-    CloudStorage as CloudStorageModel)
-from cvat.apps.engine.task import _create_thread
+    StorageChoice, StorageMethodChoice, DataChoice, Task, Project, Location)
+from cvat.apps.engine.task import JobFileMapping, _create_thread
+from cvat.apps.engine.cloud_provider import db_storage_to_storage_instance
+from cvat.apps.engine.location import StorageType, get_location_configuration
+from cvat.apps.engine.view_utils import get_cloud_storage_for_import_or_export
 from cvat.apps.dataset_manager.views import TASK_CACHE_TTL, PROJECT_CACHE_TTL, get_export_cache_dir, clear_export_cache, log_exception
 from cvat.apps.dataset_manager.bindings import CvatImportError
-from cvat.apps.engine.cloud_provider import (
-    db_storage_to_storage_instance, import_from_cloud_storage, export_to_cloud_storage
-)
-
-from cvat.apps.engine.location import StorageType, get_location_configuration
 
 class Version(Enum):
     V1 = '1.0'
@@ -134,6 +133,8 @@ class _TaskBackupBase(_BackupBase):
             'storage',
             'sorting_method',
             'deleted_frames',
+            'custom_segments',
+            'job_file_mapping',
         }
 
         self._prepare_meta(allowed_fields, data)
@@ -310,11 +311,13 @@ class TaskExporter(_ExporterBase, _TaskBackupBase):
     def _write_manifest(self, zip_object, target_dir=None):
         def serialize_task():
             task_serializer = TaskReadSerializer(self._db_task)
-            for field in ('url', 'owner', 'assignee', 'segments'):
+            for field in ('url', 'owner', 'assignee'):
                 task_serializer.fields.pop(field)
 
+            task_labels = LabelSerializer(self._db_task.get_labels(), many=True)
+
             task = self._prepare_task_meta(task_serializer.data)
-            task['labels'] = [self._prepare_label_meta(l) for l in task['labels'] if not l['has_parent']]
+            task['labels'] = [self._prepare_label_meta(l) for l in task_labels.data if not l['has_parent']]
             for label in task['labels']:
                 label['attributes'] = [self._prepare_attribute_meta(a) for a in label['attributes']]
 
@@ -332,6 +335,9 @@ class TaskExporter(_ExporterBase, _TaskBackupBase):
             segment = segment_serailizer.data
             segment.update(job_data)
 
+            if self._db_task.segment_size == 0:
+                segment.update(serialize_custom_file_mapping(db_segment))
+
             return segment
 
         def serialize_jobs():
@@ -339,12 +345,28 @@ class TaskExporter(_ExporterBase, _TaskBackupBase):
             db_segments.sort(key=lambda i: i.job_set.first().id)
             return (serialize_segment(s) for s in db_segments)
 
+        def serialize_custom_file_mapping(db_segment: models.Segment):
+            if self._db_task.mode == 'annotation':
+                files: Iterable[models.Image] = self._db_data.images.all().order_by('frame')
+                segment_files = files[db_segment.start_frame : db_segment.stop_frame + 1]
+                return {'files': list(frame.path for frame in segment_files)}
+            else:
+                assert False, (
+                    "Backups with custom file mapping are not supported"
+                    " in the 'interpolation' task mode"
+                )
+
         def serialize_data():
             data_serializer = DataSerializer(self._db_data)
             data = data_serializer.data
             data['chunk_type'] = data.pop('compressed_chunk_type')
+
             # There are no deleted frames in DataSerializer so we need to pick it
             data['deleted_frames'] = self._db_data.deleted_frames
+
+            if self._db_task.segment_size == 0:
+                data['custom_segments'] = True
+
             return self._prepare_data_meta(data)
 
         task = serialize_task()
@@ -492,6 +514,20 @@ class TaskImporter(_ImporterBase, _TaskBackupBase):
 
         return segment_size, overlap
 
+    @staticmethod
+    def _parse_custom_segments(*, jobs: Dict[str, Any]) -> JobFileMapping:
+        segments = []
+
+        for i, segment in enumerate(jobs):
+            segment_size = segment['stop_frame'] - segment['start_frame'] + 1
+            segment_files = segment['files']
+            if len(segment_files) != segment_size:
+                raise ValidationError(f"segment {i}: segment files do not match segment size")
+
+            segments.append(segment_files)
+
+        return segments
+
     def _import_task(self):
         def _write_data(zip_object):
             data_path = self._db_task.data.get_upload_dirname()
@@ -520,9 +556,22 @@ class TaskImporter(_ImporterBase, _TaskBackupBase):
         jobs = self._manifest.pop('jobs')
 
         self._prepare_task_meta(self._manifest)
-        self._manifest['segment_size'], self._manifest['overlap'] = self._calculate_segment_size(jobs)
         self._manifest['owner_id'] = self._user_id
         self._manifest['project_id'] = self._project_id
+
+        if custom_segments := data.pop('custom_segments', False):
+            job_file_mapping = self._parse_custom_segments(jobs=jobs)
+            data['job_file_mapping'] = job_file_mapping
+
+            for d in [self._manifest, data]:
+                for k in [
+                    'segment_size', 'overlap', 'start_frame', 'stop_frame',
+                    'sorting_method', 'frame_filter', 'filename_pattern'
+                ]:
+                    d.pop(k, None)
+        else:
+            self._manifest['segment_size'], self._manifest['overlap'] = \
+                self._calculate_segment_size(jobs)
 
         self._db_task = models.Task.objects.create(**self._manifest, organization_id=self._org_id)
         task_path = self._db_task.get_dirname()
@@ -552,7 +601,10 @@ class TaskImporter(_ImporterBase, _TaskBackupBase):
         data = data_serializer.data
         data['use_zip_chunks'] = use_zip_chunks
         data['client_files'] = uploaded_files
-        _create_thread(self._db_task.pk, data.copy(), True)
+        if custom_segments:
+            data['job_file_mapping'] = job_file_mapping
+
+        _create_thread(self._db_task.pk, data.copy(), isBackupRestore=True)
         db_data.start_frame = data['start_frame']
         db_data.stop_frame = data['stop_frame']
         db_data.frame_filter = data['frame_filter']
@@ -612,11 +664,13 @@ class ProjectExporter(_ExporterBase, _ProjectBackupBase):
     def _write_manifest(self, zip_object):
         def serialize_project():
             project_serializer = ProjectReadSerializer(self._db_project)
-            for field in ('assignee', 'owner', 'tasks', 'url'):
+            for field in ('assignee', 'owner', 'url'):
                 project_serializer.fields.pop(field)
 
+            project_labels = LabelSerializer(self._db_project.get_labels(), many=True).data
+
             project = self._prepare_project_meta(project_serializer.data)
-            project['labels'] = [self._prepare_label_meta(l) for l in project['labels'] if not l['has_parent']]
+            project['labels'] = [self._prepare_label_meta(l) for l in project_labels if not l['has_parent']]
             for label in project['labels']:
                 label['attributes'] = [self._prepare_attribute_meta(a) for a in label['attributes']]
 
@@ -714,7 +768,7 @@ def _create_backup(db_instance, Exporter, output_path, logger, cache_ttl):
                 os.replace(temp_file, output_path)
 
             archive_ctime = os.path.getctime(output_path)
-            scheduler = django_rq.get_scheduler()
+            scheduler = django_rq.get_scheduler(settings.CVAT_QUEUES.IMPORT_DATA.value)
             cleaning_job = scheduler.enqueue_in(time_delta=cache_ttl,
                 func=clear_export_cache,
                 file_path=output_path,
@@ -733,7 +787,7 @@ def _create_backup(db_instance, Exporter, output_path, logger, cache_ttl):
         log_exception(logger)
         raise
 
-def export(db_instance, request):
+def export(db_instance, request, queue_name):
     action = request.query_params.get('action', None)
     filename = request.query_params.get('filename', None)
 
@@ -742,13 +796,13 @@ def export(db_instance, request):
             "Unexpected action specified for the request")
 
     if isinstance(db_instance, Task):
-        filename_prefix = 'task'
+        obj_type = 'task'
         logger = slogger.task[db_instance.pk]
         Exporter = TaskExporter
         cache_ttl = TASK_CACHE_TTL
         use_target_storage_conf = request.query_params.get('use_default_location', True)
     elif isinstance(db_instance, Project):
-        filename_prefix = 'project'
+        obj_type = 'project'
         logger = slogger.project[db_instance.pk]
         Exporter = ProjectExporter
         cache_ttl = PROJECT_CACHE_TTL
@@ -764,12 +818,13 @@ def export(db_instance, request):
         field_name=StorageType.TARGET
     )
 
-    queue = django_rq.get_queue("default")
-    rq_id = "/api/{}s/{}/backup".format(filename_prefix, db_instance.pk)
+    queue = django_rq.get_queue(queue_name)
+    rq_id = f"export:{obj_type}.id{db_instance.pk}-by-{request.user}"
     rq_job = queue.fetch_job(rq_id)
     if rq_job:
         last_project_update_time = timezone.localtime(db_instance.updated_date)
-        request_time = rq_job.meta.get('request_time', None)
+        rq_request = rq_job.meta.get('request', None)
+        request_time = rq_request.get("timestamp", None) if rq_request else None
         if request_time is None or request_time < last_project_update_time:
             rq_job.cancel()
             rq_job.delete()
@@ -782,7 +837,7 @@ def export(db_instance, request):
                     timestamp = datetime.strftime(last_project_update_time,
                         "%Y_%m_%d_%H_%M_%S")
                     filename = filename or "{}_{}_backup_{}{}".format(
-                        filename_prefix, db_instance.name, timestamp,
+                        obj_type, db_instance.name, timestamp,
                         os.path.splitext(file_path)[1]).lower()
 
                     location = location_conf.get('location')
@@ -794,12 +849,20 @@ def export(db_instance, request):
                             storage_id = location_conf['storage_id']
                         except KeyError:
                             raise serializers.ValidationError(
-                                'Cloud storage location was selected for destination'
+                                'Cloud storage location was selected as the destination,'
                                 ' but cloud storage id was not specified')
-                        db_storage = get_object_or_404(CloudStorageModel, pk=storage_id)
+
+                        db_storage = get_cloud_storage_for_import_or_export(
+                            storage_id=storage_id, request=request,
+                            is_default=location_conf['is_default'])
                         storage = db_storage_to_storage_instance(db_storage)
 
-                        export_to_cloud_storage(storage, file_path, filename)
+                        try:
+                            storage.upload_file(file_path, filename)
+                        except (ValidationError, PermissionDenied, NotFound) as ex:
+                            msg = str(ex) if not isinstance(ex, ValidationError) else \
+                                '\n'.join([str(d) for d in ex.detail])
+                            return Response(data=msg, status=ex.status_code)
                         return Response(status=status.HTTP_200_OK)
                     else:
                         raise NotImplementedError()
@@ -817,9 +880,9 @@ def export(db_instance, request):
     ttl = dm.views.PROJECT_CACHE_TTL.total_seconds()
     queue.enqueue_call(
         func=_create_backup,
-        args=(db_instance, Exporter, '{}_backup.zip'.format(filename_prefix), logger, cache_ttl),
+        args=(db_instance, Exporter, '{}_backup.zip'.format(obj_type), logger, cache_ttl),
         job_id=rq_id,
-        meta={ 'request_time': timezone.localtime() },
+        meta=get_rq_job_meta(request=request, db_obj=db_instance),
         result_ttl=ttl, failure_ttl=ttl)
     return Response(status=status.HTTP_202_ACCEPTED)
 
@@ -827,12 +890,11 @@ def export(db_instance, request):
 def _download_file_from_bucket(db_storage, filename, key):
     storage = db_storage_to_storage_instance(db_storage)
 
-    data = import_from_cloud_storage(storage, key)
+    data = storage.download_fileobj(key)
     with open(filename, 'wb+') as f:
         f.write(data.getbuffer())
 
-def _import(importer, request, rq_id, Serializer, file_field_name, location_conf, filename=None):
-    queue = django_rq.get_queue("default")
+def _import(importer, request, queue, rq_id, Serializer, file_field_name, location_conf, filename=None):
     rq_job = queue.fetch_job(rq_id)
 
     if not rq_job:
@@ -857,14 +919,24 @@ def _import(importer, request, rq_id, Serializer, file_field_name, location_conf
                 storage_id = location_conf['storage_id']
             except KeyError:
                 raise serializers.ValidationError(
-                    'Cloud storage location was selected for destination'
+                    'Cloud storage location was selected as the source,'
                     ' but cloud storage id was not specified')
-            db_storage = get_object_or_404(CloudStorageModel, pk=storage_id)
+
+            db_storage = get_cloud_storage_for_import_or_export(
+                storage_id=storage_id, request=request,
+                is_default=location_conf['is_default'])
+
             key = filename
             fd, filename = mkstemp(prefix='cvat_', dir=settings.TMP_FILES_ROOT)
             dependent_job = configure_dependent_job(
-                queue, rq_id, _download_file_from_bucket,
-                db_storage, filename, key)
+                queue=queue,
+                rq_id=rq_id,
+                rq_func=_download_file_from_bucket,
+                db_storage=db_storage,
+                filename=filename,
+                key=key,
+                request=request,
+            )
 
         rq_job = queue.enqueue_call(
             func=importer,
@@ -873,6 +945,7 @@ def _import(importer, request, rq_id, Serializer, file_field_name, location_conf
             meta={
                 'tmp_file': filename,
                 'tmp_file_descriptor': fd,
+                **get_rq_job_meta(request=request, db_obj=None)
             },
             depends_on=dependent_job
         )
@@ -902,11 +975,11 @@ def _import(importer, request, rq_id, Serializer, file_field_name, location_conf
 def get_backup_dirname():
     return settings.TMP_FILES_ROOT
 
-def import_project(request, filename=None):
+def import_project(request, queue_name, filename=None):
     if 'rq_id' in request.data:
         rq_id = request.data['rq_id']
     else:
-        rq_id = "{}@/api/projects/{}/import".format(request.user, uuid.uuid4())
+        rq_id = f"import:project.{uuid.uuid4()}-by-{request.user}"
     Serializer = ProjectFileSerializer
     file_field_name = 'project_file'
 
@@ -915,9 +988,12 @@ def import_project(request, filename=None):
         field_name=StorageType.SOURCE,
     )
 
+    queue = django_rq.get_queue(queue_name)
+
     return _import(
         importer=_import_project,
         request=request,
+        queue=queue,
         rq_id=rq_id,
         Serializer=Serializer,
         file_field_name=file_field_name,
@@ -925,11 +1001,11 @@ def import_project(request, filename=None):
         filename=filename
     )
 
-def import_task(request, filename=None):
+def import_task(request, queue_name, filename=None):
     if 'rq_id' in request.data:
         rq_id = request.data['rq_id']
     else:
-        rq_id = "{}@/api/tasks/{}/import".format(request.user, uuid.uuid4())
+        rq_id = f"import:task.{uuid.uuid4()}-by-{request.user}"
     Serializer = TaskFileSerializer
     file_field_name = 'task_file'
 
@@ -938,9 +1014,12 @@ def import_task(request, filename=None):
         field_name=StorageType.SOURCE
     )
 
+    queue = django_rq.get_queue(queue_name)
+
     return _import(
         importer=_import_task,
         request=request,
+        queue=queue,
         rq_id=rq_id,
         Serializer=Serializer,
         file_field_name=file_field_name,

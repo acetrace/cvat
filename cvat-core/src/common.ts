@@ -1,4 +1,5 @@
 // Copyright (C) 2019-2022 Intel Corporation
+// Copyright (C) 2022-2023s CVAT.ai Corporation
 //
 // SPDX-License-Identifier: MIT
 
@@ -10,6 +11,10 @@ export function isBoolean(value): boolean {
 
 export function isInteger(value): boolean {
     return typeof value === 'number' && Number.isInteger(value);
+}
+
+export function isEmail(value): boolean {
+    return typeof value === 'string' && RegExp(/^[^\s@]+@[^\s@]+\.[^\s@]+$/).test(value);
 }
 
 // Called with specific Enum context
@@ -46,10 +51,10 @@ export function checkExclusiveFields(obj, exclusive, ignore): void {
         exclusive: [],
         other: [],
     };
-    for (const field in Object.keys(obj)) {
-        if (!(field in ignore)) {
-            if (field in exclusive) {
-                if (fields.other.length) {
+    for (const field in obj) {
+        if (!(ignore.includes(field))) {
+            if (exclusive.includes(field)) {
+                if (fields.other.length || fields.exclusive.length) {
                     throw new ArgumentError(`Do not use the filter field "${field}" with others`);
                 }
                 fields.exclusive.push(field);
@@ -60,7 +65,7 @@ export function checkExclusiveFields(obj, exclusive, ignore): void {
     }
 }
 
-export function checkObjectType(name, value, type, instance): boolean {
+export function checkObjectType(name, value, type, instance?): boolean {
     if (type) {
         if (typeof value !== type) {
             // specific case for integers which aren't native type in JS
@@ -87,33 +92,22 @@ export function checkObjectType(name, value, type, instance): boolean {
 }
 
 export class FieldUpdateTrigger {
-    constructor() {
-        let updatedFlags = {};
+    #updatedFlags: Record<string, boolean> = {};
 
-        Object.defineProperties(
-            this,
-            Object.freeze({
-                reset: {
-                    value: () => {
-                        updatedFlags = {};
-                    },
-                },
-                update: {
-                    value: (name) => {
-                        updatedFlags[name] = true;
-                    },
-                },
-                getUpdated: {
-                    value: (data, propMap = {}) => {
-                        const result = {};
-                        for (const updatedField of Object.keys(updatedFlags)) {
-                            result[propMap[updatedField] || updatedField] = data[updatedField];
-                        }
-                        return result;
-                    },
-                },
-            }),
-        );
+    reset(): void {
+        this.#updatedFlags = {};
+    }
+
+    update(name: string): void {
+        this.#updatedFlags[name] = true;
+    }
+
+    getUpdated(data: object, propMap: Record<string, string> = {}): Record<string, unknown> {
+        const result = {};
+        for (const updatedField of Object.keys(this.#updatedFlags)) {
+            result[propMap[updatedField] || updatedField] = data[updatedField];
+        }
+        return result;
     }
 }
 

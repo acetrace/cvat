@@ -1,5 +1,5 @@
 // Copyright (C) 2022 Intel Corporation
-// Copyright (C) 2022 CVAT.ai Corporation
+// Copyright (C) 2022-2023 CVAT.ai Corporation
 //
 // SPDX-License-Identifier: MIT
 
@@ -26,6 +26,7 @@ interface ResourceFilterProps {
     recentVisible: boolean;
     builderVisible: boolean;
     value: string | null;
+    disabled?: boolean;
     onPredefinedVisibleChange?: (visible: boolean) => void;
     onBuilderVisibleChange(visible: boolean): void;
     onRecentVisibleChange(visible: boolean): void;
@@ -117,6 +118,7 @@ export default function ResourceFilterHOC(
         const {
             predefinedVisible, builderVisible, recentVisible, value,
             onPredefinedVisibleChange, onBuilderVisibleChange, onRecentVisibleChange, onApplyFilter,
+            disabled,
         } = props;
 
         const user = useSelector((state: CombinedState) => state.auth.user);
@@ -128,15 +130,6 @@ export default function ResourceFilterHOC(
         useEffect(() => {
             setRecentFilters(receiveRecentFilters());
             setIsMounted(true);
-
-            const listener = (event: MouseEvent): void => {
-                const path: HTMLElement[] = event.composedPath()
-                    .filter((el: EventTarget) => el instanceof HTMLElement) as HTMLElement[];
-                if (path.some((el: HTMLElement) => el.id === 'root') && !path.some((el: HTMLElement) => el.classList.contains('ant-btn'))) {
-                    onBuilderVisibleChange(false);
-                    onRecentVisibleChange(false);
-                }
-            };
 
             try {
                 if (value) {
@@ -152,10 +145,26 @@ export default function ResourceFilterHOC(
             } catch (_: any) {
                 // nothing to do
             }
+        }, []);
+
+        useEffect(() => {
+            const listener = (event: MouseEvent): void => {
+                const path: HTMLElement[] = event.composedPath()
+                    .filter((el: EventTarget) => el instanceof HTMLElement) as HTMLElement[];
+                if (path.some((el: HTMLElement) => el.id === 'root') && !path.some((el: HTMLElement) => el.classList.contains('ant-btn'))) {
+                    if (builderVisible) {
+                        onBuilderVisibleChange(false);
+                    }
+
+                    if (predefinedVisible) {
+                        onRecentVisibleChange(false);
+                    }
+                }
+            };
 
             window.addEventListener('click', listener);
             return () => window.removeEventListener('click', listener);
-        }, []);
+        }, [builderVisible, predefinedVisible]);
 
         useEffect(() => {
             if (!isMounted) {
@@ -231,7 +240,11 @@ export default function ResourceFilterHOC(
                                 </div>
                             )}
                         >
-                            <Button type='default' onClick={() => onPredefinedVisibleChange(!predefinedVisible)}>
+                            <Button
+                                className='cvat-quick-filters-button'
+                                type='default'
+                                onClick={() => onPredefinedVisibleChange(!predefinedVisible)}
+                            >
                                 Quick filters
                                 { appliedFilter.predefined ?
                                     <FilterFilled /> :
@@ -241,6 +254,7 @@ export default function ResourceFilterHOC(
                     ) : null
                 }
                 <Dropdown
+                    disabled={disabled}
                     placement='bottomRight'
                     visible={builderVisible}
                     destroyPopupOnHide
@@ -284,6 +298,7 @@ export default function ResourceFilterHOC(
                                     )}
                                 >
                                     <Button
+                                        className='cvat-recent-filters-button'
                                         size='small'
                                         type='text'
                                         onClick={
@@ -306,6 +321,7 @@ export default function ResourceFilterHOC(
                             />
                             <Space className='cvat-resource-page-filters-space'>
                                 <Button
+                                    className='cvat-reset-filters-button'
                                     disabled={!QbUtils.queryString(state, config)}
                                     size='small'
                                     onClick={() => {
@@ -320,6 +336,7 @@ export default function ResourceFilterHOC(
                                     Reset
                                 </Button>
                                 <Button
+                                    className='cvat-apply-filters-button'
                                     size='small'
                                     type='primary'
                                     onClick={() => {
@@ -341,7 +358,7 @@ export default function ResourceFilterHOC(
                         </div>
                     )}
                 >
-                    <Button type='default' onClick={() => onBuilderVisibleChange(!builderVisible)}>
+                    <Button className='cvat-switch-filters-constructor-button' type='default' onClick={() => onBuilderVisibleChange(!builderVisible)}>
                         Filter
                         { appliedFilter.built || appliedFilter.recent ?
                             <FilterFilled /> :
@@ -349,7 +366,8 @@ export default function ResourceFilterHOC(
                     </Button>
                 </Dropdown>
                 <Button
-                    disabled={!(appliedFilter.built || appliedFilter.predefined || appliedFilter.recent)}
+                    className='cvat-clear-filters-button'
+                    disabled={!(appliedFilter.built || appliedFilter.predefined || appliedFilter.recent) || disabled}
                     size='small'
                     type='link'
                     onClick={() => { setAppliedFilter({ ...defaultAppliedFilter }); }}

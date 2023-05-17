@@ -1,4 +1,5 @@
 // Copyright (C) 2020-2022 Intel Corporation
+// Copyright (C) 2023 CVAT.ai Corporation
 //
 // SPDX-License-Identifier: MIT
 
@@ -15,6 +16,7 @@ const defaultState: AuthState = {
     allowChangePassword: false,
     showChangePasswordDialog: false,
     allowResetPassword: false,
+    hasEmailVerificationBeenSent: false,
 };
 
 export default function (state = defaultState, action: AuthActions | BoundariesActions): AuthState {
@@ -40,12 +42,16 @@ export default function (state = defaultState, action: AuthActions | BoundariesA
                 ...state,
                 fetching: false,
                 user: action.payload.user,
+                hasEmailVerificationBeenSent: false,
             };
-        case AuthActionTypes.LOGIN_FAILED:
+        case AuthActionTypes.LOGIN_FAILED: {
+            const { hasEmailVerificationBeenSent } = action.payload;
             return {
                 ...state,
                 fetching: false,
+                hasEmailVerificationBeenSent,
             };
+        }
         case AuthActionTypes.LOGOUT:
             return {
                 ...state,

@@ -1,20 +1,25 @@
 # Copyright (C) 2021-2022 Intel Corporation
-# Copyright (C) 2022 CVAT.ai Corporation
+# Copyright (C) 2022-2023 CVAT.ai Corporation
 #
 # SPDX-License-Identifier: MIT
 
 import json
+import xml.etree.ElementTree as ET
+import zipfile
 from copy import deepcopy
 from http import HTTPStatus
+from io import BytesIO
 from typing import List
 
 import pytest
+from cvat_sdk.api_client.api_client import ApiClient, Endpoint
 from cvat_sdk.core.helpers import get_paginated_collection
 from deepdiff import DeepDiff
+from PIL import Image
 
 from shared.utils.config import make_api_client
 
-from .utils import export_dataset
+from .utils import CollectionSimpleFilterTestBase, export_dataset
 
 
 def get_job_staff(job, tasks, projects):
@@ -47,7 +52,7 @@ def filter_jobs(jobs, tasks, org):
     return jobs, kwargs
 
 
-@pytest.mark.usefixtures("dontchangedb")
+@pytest.mark.usefixtures("restore_db_per_class")
 class TestGetJobs:
     def _test_get_job_200(self, user, jid, data, **kwargs):
         with make_api_client(user) as client:
@@ -97,7 +102,7 @@ class TestGetJobs:
                     self._test_get_job_403(user["username"], job["id"], **kwargs)
 
 
-@pytest.mark.usefixtures("dontchangedb")
+@pytest.mark.usefixtures("restore_db_per_class")
 class TestListJobs:
     def _test_list_jobs_200(self, user, data, **kwargs):
         with make_api_client(user) as client:
@@ -142,7 +147,34 @@ class TestListJobs:
                 self._test_list_jobs_403(user["username"], **kwargs)
 
 
-@pytest.mark.usefixtures("dontchangedb")
+class TestJobsListFilters(CollectionSimpleFilterTestBase):
+    field_lookups = {
+        "assignee": ["assignee", "username"],
+    }
+
+    @pytest.fixture(autouse=True)
+    def setup(self, restore_db_per_class, admin_user, jobs):
+        self.user = admin_user
+        self.samples = jobs
+
+    def _get_endpoint(self, api_client: ApiClient) -> Endpoint:
+        return api_client.jobs_api.list_endpoint
+
+    @pytest.mark.parametrize(
+        "field",
+        (
+            "assignee",
+            "state",
+            "stage",
+            "task_id",
+            "project_id",
+        ),
+    )
+    def test_can_use_simple_filter_for_object_list(self, field):
+        return super().test_can_use_simple_filter_for_object_list(field)
+
+
+@pytest.mark.usefixtures("restore_db_per_class")
 class TestGetAnnotations:
     def _test_get_job_annotations_200(self, user, jid, data, **kwargs):
         with make_api_client(user) as client:
@@ -150,7 +182,6 @@ class TestGetAnnotations:
             assert response.status == HTTPStatus.OK
 
             response_data = json.loads(response.data)
-            response_data["shapes"] = sorted(response_data["shapes"], key=lambda a: a["id"])
             assert (
                 DeepDiff(data, response_data, exclude_regex_paths=r"root\['version|updated_date'\]")
                 == {}
@@ -266,7 +297,7 @@ class TestGetAnnotations:
             self._test_get_job_annotations_403(username, job_id, **kwargs)
 
 
-@pytest.mark.usefixtures("changedb")
+@pytest.mark.usefixtures("restore_db_per_function")
 class TestPatchJobAnnotations:
     def _check_respone(self, username, jid, expect_success, data=None, org=None):
         kwargs = {}
@@ -303,7 +334,10 @@ class TestPatchJobAnnotations:
     def request_data(self, annotations):
         def get_data(jid):
             data = deepcopy(annotations["job"][str(jid)])
-            data["shapes"][0].update({"points": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]})
+            if data["shapes"][0]["type"] == "skeleton":
+                data["shapes"][0]["elements"][0].update({"points": [2.0, 3.0, 4.0, 5.0]})
+            else:
+                data["shapes"][0].update({"points": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]})
             data["version"] += 1
             return data
 
@@ -338,7 +372,7 @@ class TestPatchJobAnnotations:
         users = find_users(role=role, org=org)
         jobs = jobs_by_org[org]
         filtered_jobs = filter_jobs_with_shapes(jobs)
-        username, jid = find_job_staff_user(filtered_jobs, users, job_staff, [18])
+        username, jid = find_job_staff_user(filtered_jobs, users, job_staff)
 
         data = request_data(jid)
         self._check_respone(username, jid, expect_success, data, org=org)
@@ -362,7 +396,7 @@ class TestPatchJobAnnotations:
         users = find_users(privilege=privilege, exclude_org=org)
         jobs = jobs_by_org[org]
         filtered_jobs = filter_jobs_with_shapes(jobs)
-        username, jid = find_job_staff_user(filtered_jobs, users, False, [18])
+        username, jid = find_job_staff_user(filtered_jobs, users, False)
 
         data = request_data(jid)
         self._check_respone(username, jid, expect_success, data, org=org)
@@ -402,7 +436,7 @@ class TestPatchJobAnnotations:
         self._check_respone(username, jid, expect_success, data, org=org)
 
 
-@pytest.mark.usefixtures("changedb")
+@pytest.mark.usefixtures("restore_db_per_function")
 class TestPatchJob:
     @pytest.fixture(scope="class")
     def find_task_staff_user(self, is_task_staff):
@@ -489,7 +523,57 @@ class TestPatchJob:
                 assert response.status == HTTPStatus.FORBIDDEN
 
 
-@pytest.mark.usefixtures("dontchangedb")
+def _check_coco_job_annotations(content, values_to_be_checked):
+    exported_annotations = json.loads(content)
+    if "shapes_length" in values_to_be_checked:
+        assert values_to_be_checked["shapes_length"] == len(exported_annotations["annotations"])
+    assert values_to_be_checked["job_size"] == len(exported_annotations["images"])
+    assert values_to_be_checked["task_size"] > len(exported_annotations["images"])
+
+
+def _check_cvat_for_images_job_annotations(content, values_to_be_checked):
+    document = ET.fromstring(content)
+    # check meta information
+    meta = document.find("meta")
+    instance = list(meta)[0]
+    assert instance.tag == "job"
+    assert instance.find("id").text == values_to_be_checked["job_id"]
+    assert instance.find("size").text == str(values_to_be_checked["job_size"])
+    assert instance.find("start_frame").text == str(values_to_be_checked["start_frame"])
+    assert instance.find("stop_frame").text == str(values_to_be_checked["stop_frame"])
+    assert instance.find("mode").text == values_to_be_checked["mode"]
+    assert len(instance.find("segments")) == 1
+
+    # check number of images, their sorting, number of annotations
+    images = document.findall("image")
+    assert len(images) == values_to_be_checked["job_size"]
+    if "shapes_length" in values_to_be_checked:
+        assert len(list(document.iter("box"))) == values_to_be_checked["shapes_length"]
+    current_id = values_to_be_checked["start_frame"]
+    for image_elem in images:
+        assert image_elem.attrib["id"] == str(current_id)
+        current_id += 1
+
+
+def _check_cvat_for_video_job_annotations(content, values_to_be_checked):
+    document = ET.fromstring(content)
+    # check meta information
+    meta = document.find("meta")
+    instance = list(meta)[0]
+    assert instance.tag == "job"
+    assert instance.find("id").text == values_to_be_checked["job_id"]
+    assert instance.find("size").text == str(values_to_be_checked["job_size"])
+    assert instance.find("start_frame").text == str(values_to_be_checked["start_frame"])
+    assert instance.find("stop_frame").text == str(values_to_be_checked["stop_frame"])
+    assert instance.find("mode").text == values_to_be_checked["mode"]
+    assert len(instance.find("segments")) == 1
+
+    # check number of annotations
+    if values_to_be_checked.get("shapes_length") is not None:
+        assert len(list(document.iter("track"))) == values_to_be_checked["tracks_length"]
+
+
+@pytest.mark.usefixtures("restore_db_per_class")
 class TestJobDataset:
     def _export_dataset(self, username, jid, **kwargs):
         with make_api_client(username) as api_client:
@@ -506,7 +590,156 @@ class TestJobDataset:
         response = self._export_dataset(admin_user, job["id"], format="CVAT for images 1.1")
         assert response.data
 
-    def test_can_export_annotations(self, admin_user: str, jobs_with_shapes: List):
-        job = jobs_with_shapes[0]
-        response = self._export_annotations(admin_user, job["id"], format="CVAT for images 1.1")
+    def test_non_admin_can_export_dataset(self, users, tasks, jobs_with_shapes):
+        job_id, username = next(
+            (
+                (job["id"], tasks[job["task_id"]]["owner"]["username"])
+                for job in jobs_with_shapes
+                if "admin" not in users[tasks[job["task_id"]]["owner"]["id"]]["groups"]
+                and tasks[job["task_id"]]["target_storage"] is None
+                and tasks[job["task_id"]]["organization"] is None
+            )
+        )
+        response = self._export_dataset(username, job_id, format="CVAT for images 1.1")
         assert response.data
+
+    def test_non_admin_can_export_annotations(self, users, tasks, jobs_with_shapes):
+        job_id, username = next(
+            (
+                (job["id"], tasks[job["task_id"]]["owner"]["username"])
+                for job in jobs_with_shapes
+                if "admin" not in users[tasks[job["task_id"]]["owner"]["id"]]["groups"]
+                and tasks[job["task_id"]]["target_storage"] is None
+                and tasks[job["task_id"]]["organization"] is None
+            )
+        )
+        response = self._export_annotations(username, job_id, format="CVAT for images 1.1")
+        assert response.data
+
+    @pytest.mark.parametrize("username, jid", [("admin1", 14)])
+    @pytest.mark.parametrize(
+        "anno_format, anno_file_name, check_func",
+        [
+            ("COCO 1.0", "annotations/instances_default.json", _check_coco_job_annotations),
+            ("CVAT for images 1.1", "annotations.xml", _check_cvat_for_images_job_annotations),
+        ],
+    )
+    def test_exported_job_dataset_structure(
+        self,
+        username,
+        jid,
+        anno_format,
+        anno_file_name,
+        check_func,
+        tasks,
+        jobs,
+        annotations,
+    ):
+        job_data = jobs[jid]
+        annotations_before = annotations["job"][str(jid)]
+
+        values_to_be_checked = {
+            "task_size": tasks[job_data["task_id"]]["size"],
+            # NOTE: data step is not stored in assets, default = 1
+            "job_size": job_data["stop_frame"] - job_data["start_frame"] + 1,
+            "start_frame": job_data["start_frame"],
+            "stop_frame": job_data["stop_frame"],
+            "shapes_length": len(annotations_before["shapes"]),
+            "job_id": str(jid),
+            "mode": job_data["mode"],
+        }
+
+        response = self._export_dataset(username, jid, format=anno_format)
+        assert response.data
+        with zipfile.ZipFile(BytesIO(response.data)) as zip_file:
+            assert (
+                len(zip_file.namelist()) == values_to_be_checked["job_size"] + 1
+            )  # images + annotation file
+            content = zip_file.read(anno_file_name)
+        check_func(content, values_to_be_checked)
+
+    @pytest.mark.parametrize("username", ["admin1"])
+    @pytest.mark.parametrize("jid", [25, 26])
+    @pytest.mark.parametrize(
+        "anno_format, anno_file_name, check_func",
+        [
+            ("CVAT for images 1.1", "annotations.xml", _check_cvat_for_images_job_annotations),
+            ("CVAT for video 1.1", "annotations.xml", _check_cvat_for_video_job_annotations),
+            (
+                "COCO Keypoints 1.0",
+                "annotations/person_keypoints_default.json",
+                _check_coco_job_annotations,
+            ),
+        ],
+    )
+    def test_export_job_among_several_jobs_in_task(
+        self, username, jid, anno_format, anno_file_name, check_func, tasks, jobs, annotations
+    ):
+        job_data = jobs[jid]
+        annotations_before = annotations["job"][str(jid)]
+
+        values_to_be_checked = {
+            "task_size": tasks[job_data["task_id"]]["size"],
+            # NOTE: data step is not stored in assets, default = 1
+            "job_size": job_data["stop_frame"] - job_data["start_frame"] + 1,
+            "start_frame": job_data["start_frame"],
+            "stop_frame": job_data["stop_frame"],
+            "job_id": str(jid),
+            "tracks_length": len(annotations_before["tracks"]),
+            "mode": job_data["mode"],
+        }
+
+        response = self._export_dataset(username, jid, format=anno_format)
+        assert response.data
+        with zipfile.ZipFile(BytesIO(response.data)) as zip_file:
+            assert (
+                len(zip_file.namelist()) == values_to_be_checked["job_size"] + 1
+            )  # images + annotation file
+            content = zip_file.read(anno_file_name)
+        check_func(content, values_to_be_checked)
+
+
+@pytest.mark.usefixtures("restore_db_per_class")
+class TestGetJobPreview:
+    def _test_get_job_preview_200(self, username, jid, **kwargs):
+        with make_api_client(username) as client:
+            (_, response) = client.jobs_api.retrieve_preview(jid, **kwargs)
+
+            assert response.status == HTTPStatus.OK
+            (width, height) = Image.open(BytesIO(response.data)).size
+            assert width > 0 and height > 0
+
+    def _test_get_job_preview_403(self, username, jid, **kwargs):
+        with make_api_client(username) as client:
+            (_, response) = client.jobs_api.retrieve(
+                jid, **kwargs, _check_status=False, _parse_response=False
+            )
+            assert response.status == HTTPStatus.FORBIDDEN
+
+    @pytest.mark.parametrize("org", [None, "", 1, 2])
+    def test_admin_get_job_preview(self, jobs, tasks, org):
+        jobs, kwargs = filter_jobs(jobs, tasks, org)
+
+        # keep only the reasonable amount of jobs
+        for job in jobs[:8]:
+            self._test_get_job_preview_200("admin2", job["id"], **kwargs)
+
+    @pytest.mark.parametrize("org_id", ["", None, 1, 2])
+    @pytest.mark.parametrize("groups", [["business"], ["user"], ["worker"], []])
+    def test_non_admin_get_job_preview(
+        self, org_id, groups, users, jobs, tasks, projects, org_staff
+    ):
+        # keep the reasonable amount of users and jobs
+        users = [u for u in users if u["groups"] == groups][:4]
+        jobs, kwargs = filter_jobs(jobs, tasks, org_id)
+        org_staff = org_staff(org_id)
+
+        for job in jobs[:8]:
+            job_staff = get_job_staff(job, tasks, projects)
+
+            # check if the specific user in job_staff to see the job preview
+            for user in users:
+                if user["id"] in job_staff | org_staff:
+                    self._test_get_job_preview_200(user["username"], job["id"], **kwargs)
+                else:
+                    self._test_get_job_preview_403(user["username"], job["id"], **kwargs)

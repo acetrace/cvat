@@ -5,11 +5,12 @@
 import io
 from contextlib import ExitStack
 from logging import Logger
-from typing import Tuple
+from typing import List, Tuple
 
 import packaging.version as pv
 import pytest
-from cvat_sdk import Client
+from cvat_sdk import Client, models
+from cvat_sdk.api_client.exceptions import NotFoundException
 from cvat_sdk.core.client import Config, make_client
 from cvat_sdk.core.exceptions import IncompatibleVersionException, InvalidHostException
 from cvat_sdk.exceptions import ApiException
@@ -21,7 +22,7 @@ class TestClientUsecases:
     @pytest.fixture(autouse=True)
     def setup(
         self,
-        changedb,  # force fixture call order to allow DB setup
+        restore_db_per_function,  # force fixture call order to allow DB setup
         fxt_logger: Tuple[Logger, io.StringIO],
         fxt_client: Client,
         fxt_stdout: io.StringIO,
@@ -56,6 +57,19 @@ class TestClientUsecases:
         version = self.client.get_server_version()
 
         assert (version.major, version.minor) >= (2, 0)
+
+
+def test_can_strip_trailing_slash_in_hostname_in_make_client(admin_user: str):
+    host, port = BASE_URL.split("://", maxsplit=1)[1].rsplit(":", maxsplit=1)
+
+    with make_client(host=host + "/", port=port, credentials=(admin_user, USER_PASS)) as client:
+        assert client.api_map.host == BASE_URL
+
+
+def test_can_strip_trailing_slash_in_hostname_in_client_ctor(admin_user: str):
+    with Client(url=BASE_URL + "/") as client:
+        client.login((admin_user, USER_PASS))
+        assert client.api_map.host == BASE_URL
 
 
 def test_can_detect_server_schema_if_not_provided():
@@ -146,6 +160,51 @@ def test_can_check_server_version_in_method(fxt_logger: Tuple[Logger, io.StringI
     assert "Server version '0' is not compatible with SDK version" in logger_stream.getvalue()
 
 
+@pytest.mark.parametrize(
+    "server_version, supported_versions, expect_supported",
+    [
+        # Currently, it is ~=, as defined in https://peps.python.org/pep-0440/
+        ("3.2", ["2.0"], False),
+        ("2", ["2.1"], False),
+        ("2.1", ["2.1"], True),
+        ("2.1a", ["2.1"], False),
+        ("2.1.post1", ["2.1"], True),
+        ("2.1", ["2.1.pre1"], True),
+        ("2.1.1", ["2.1"], True),
+        ("2.2", ["2.1"], False),
+        ("2.2", ["2.1.0", "2.3"], False),
+        ("2.2", ["2.1", "2.2", "2.3"], True),
+        ("2.2.post1", ["2.1", "2.2", "2.3"], True),
+        ("2.2.pre1", ["2.1", "2.2", "2.3"], False),
+        ("2.2", ["2.3"], False),
+        ("2.1.0.dev123", ["2.1.post2"], False),
+        ("1!1.3", ["2.1"], False),
+        ("1!1.3.1", ["2.1", "1!1.3"], True),
+        ("1!1.1.dev12", ["1!1.1"], False),
+    ],
+)
+def test_can_check_server_version_compatibility(
+    fxt_logger: Tuple[Logger, io.StringIO],
+    monkeypatch: pytest.MonkeyPatch,
+    server_version: str,
+    supported_versions: List[str],
+    expect_supported: bool,
+):
+    logger, _ = fxt_logger
+
+    monkeypatch.setattr(Client, "get_server_version", lambda _: pv.Version(server_version))
+    monkeypatch.setattr(
+        Client, "SUPPORTED_SERVER_VERSIONS", [pv.Version(v) for v in supported_versions]
+    )
+    config = Config(allow_unsupported_server=False)
+
+    with ExitStack() as es:
+        if not expect_supported:
+            es.enter_context(pytest.raises(IncompatibleVersionException))
+
+        Client(url=BASE_URL, logger=logger, config=config, check_server_version=True)
+
+
 @pytest.mark.parametrize("verify", [True, False])
 def test_can_control_ssl_verification_with_config(verify: bool):
     config = Config(verify_ssl=verify)
@@ -153,3 +212,48 @@ def test_can_control_ssl_verification_with_config(verify: bool):
     client = Client(BASE_URL, config=config)
 
     assert client.api_client.configuration.verify_ssl == verify
+
+
+def test_organization_contexts(admin_user: str):
+    with make_client(BASE_URL, credentials=(admin_user, USER_PASS)) as client:
+        assert client.organization_slug is None
+
+        org = client.organizations.create(models.OrganizationWriteRequest(slug="testorg"))
+
+        # create a project in the personal workspace
+        client.organization_slug = ""
+        personal_project = client.projects.create(models.ProjectWriteRequest(name="Personal"))
+        assert personal_project.organization is None
+
+        # create a project in the organization
+        client.organization_slug = org.slug
+        org_project = client.projects.create(models.ProjectWriteRequest(name="Org"))
+        assert org_project.organization == org.id
+
+        # both projects should be visible with no context
+        client.organization_slug = None
+        client.projects.retrieve(personal_project.id)
+        client.projects.retrieve(org_project.id)
+
+        # only the personal project should be visible in the personal workspace
+        client.organization_slug = ""
+        client.projects.retrieve(personal_project.id)
+        with pytest.raises(NotFoundException):
+            client.projects.retrieve(org_project.id)
+
+        # only the organizational project should be visible in the organization
+        client.organization_slug = org.slug
+        client.projects.retrieve(org_project.id)
+        with pytest.raises(NotFoundException):
+            client.projects.retrieve(personal_project.id)
+
+
+def test_organization_context_manager():
+    client = Client(BASE_URL)
+
+    client.organization_slug = "abc"
+
+    with client.organization_context("def"):
+        assert client.organization_slug == "def"
+
+    assert client.organization_slug == "abc"
