@@ -1417,7 +1417,7 @@ async function getData(tid, jid, chunk) {
         response = await workerAxios.get(`${backendAPI}/${url}`, {
             params: {
                 ...enableOrganization(),
-                quality: 'original',
+                quality: 'compressed',
                 type: 'chunk',
                 number: chunk,
             },
